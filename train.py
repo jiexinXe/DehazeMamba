@@ -9,15 +9,15 @@ import torch.nn as nn
 import torch
 from torch.cuda.amp import GradScaler, autocast
 
-from model import MambaSSM  # 引入 MambaSSM 模型
+from model import MambaSSM  # 导入新的 MambaSSM 模型
 from utils import *  # 导入工具函数
 import dataloader
 
 # 全局变量和参数
 dtype = torch.float16  # 切换为 float16
 USE_GPU = True
-EPOCH = 12
-BATCH_SIZE = 2
+EPOCH = 100
+BATCH_SIZE = 2  # 调整为2
 ACCUMULATION_STEPS = 4  # 梯度累积步数
 print_every = int(50 / BATCH_SIZE * 64)
 Load_model = False
@@ -37,7 +37,8 @@ START_EPOCH = 0
 loader_train = None
 loader_val = None
 
-# 设备
+
+# 设置设备（GPU或CPU）
 def set_device():
     if USE_GPU and torch.cuda.is_available():
         device = torch.device('cuda')
@@ -47,17 +48,40 @@ def set_device():
     print('using device:', device)
     return device
 
+
+# 定义复合损失函数
+class CombinedLoss(nn.Module):
+    def __init__(self):
+        super(CombinedLoss, self).__init__()
+        self.l1_loss = nn.L1Loss()
+        self.fft_loss_weight = 0.1
+
+    def fft_loss(self, pred, target):
+        # 将输入从半精度转换为全精度，以便执行 FFT 计算
+        pred_float = pred.float()
+        target_float = target.float()
+
+        pred_fft = torch.fft.fft2(pred_float)
+        target_fft = torch.fft.fft2(target_float)
+        return torch.mean(torch.abs(pred_fft - target_fft))
+
+    def forward(self, pred, target):
+        l1 = self.l1_loss(pred, target)
+        fft_loss = self.fft_loss(pred, target)
+        return l1 + self.fft_loss_weight * fft_loss
+
+
 # 训练函数
 def train(model, optimizer, criterion, device, epochs=1, start=0):
     global loader_train, loader_val
     model = model.to(device=device)
-    scaler = GradScaler()  # 使用 PyTorch 的混合精度训练，防止显存不够
+    scaler = GradScaler()  # 使用混合精度训练
 
     if not os.path.isdir(NAME + '_save'):
         os.mkdir(NAME + '_save')
 
     for e in range(start, epochs):
-        print('epoch: %d' % e)
+        print(f'epoch: {e}')
 
         losses = AverageMeter()
         batch_time = AverageMeter()
@@ -69,7 +93,7 @@ def train(model, optimizer, criterion, device, epochs=1, start=0):
         optimizer.zero_grad()  # 初始化优化器梯度
         for t, (img_original, img_haze) in enumerate(loader_train):
             model.train()  # 设置模型为训练模式
-            img_original = img_original.to(device=device).half()
+            img_original = img_original.to(device=device).half()  # 使用半精度
             img_haze = img_haze.to(device=device).half()
 
             if hasattr(torch.cuda, 'empty_cache'):
@@ -78,7 +102,7 @@ def train(model, optimizer, criterion, device, epochs=1, start=0):
             with autocast():
                 output = model(img_haze)
                 loss = criterion(output, img_original)
-                loss = loss / ACCUMULATION_STEPS  # 梯度累积步数
+                loss = loss / ACCUMULATION_STEPS  # 梯度累积
 
             scaler.scale(loss).backward()
 
@@ -87,26 +111,19 @@ def train(model, optimizer, criterion, device, epochs=1, start=0):
                 scaler.update()
                 optimizer.zero_grad()
 
-            losses.update(loss.item() * ACCUMULATION_STEPS)  # 累积的损失值乘回累积步数
+            losses.update(loss.item() * ACCUMULATION_STEPS)
 
             batch_time.update(time.time() - end_time)
             end_time = time.time()
 
             if t % print_every == 0:
-                print('Train: [%d/%d]\t'
-                      'Time %.3f (%.3f)\t'
-                      'Loss %.4f (%.4f)'
-                      % (t, len(loader_train), batch_time.val, batch_time.avg, losses.val, losses.avg))
+                print(f'Train: [{t}/{len(loader_train)}]\t'
+                      f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      f'Loss {losses.val:.4f} ({losses.avg:.4f})')
 
         test_epoch(model, criterion, loader_val, device, e, epochs)
+        save_model_optimizer_history(model, optimizer, filepath=f'{NAME}_save/epoch{e}.pth', device=device)
 
-        save_model_optimizer_history(model, optimizer, filepath=NAME + '_save' + '/epoch%d.pth' % (e), device=device)
-
-# 将张量转换为图像并显示
-def tensor_showImg(a):
-    a = a.cpu()
-    image_PIL = transforms.ToPILImage()(a)
-    image_PIL.show()
 
 # 测试函数
 def test_epoch(model, criterion, loader_val, device, epoch, end_epoch, verbo=True):
@@ -134,13 +151,12 @@ def test_epoch(model, criterion, loader_val, device, epoch, end_epoch, verbo=Tru
         end_time = time.time()
 
         if batch_idx % 20 == 0 and verbo == True:
-            print('Test: [%d/%d]\t'
-                  'Time %.3f (%.3f)\t'
-                  'Loss %.4f (%.4f)' % (batch_idx, len(loader_val),
-                                       batch_time.val, batch_time.avg,
-                                       losses.val, losses.avg))
+            print(f'Test: [{batch_idx}/{len(loader_val)}]\t'
+                  f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  f'Loss {losses.val:.4f} ({losses.avg:.4f})')
 
-    print('Test: [%d/%d]' % (epoch, end_epoch))
+    print(f'Test: [{epoch}/{end_epoch}]')
+
 
 # 检查参数是否属于全连接层
 def is_fc(para_name):
@@ -152,6 +168,7 @@ def is_fc(para_name):
     else:
         return False
 
+
 # 设置网络的学习率
 def net_lr(model, fc_lr, lr):
     params = []
@@ -162,6 +179,7 @@ def net_lr(model, fc_lr, lr):
             params += [{'params': [param_value], 'lr': lr}]
     return params
 
+
 # 设置随机种子
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -170,7 +188,8 @@ def setup_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
 
-# 训练主函数
+
+# 主训练函数
 def train_main(args):
     global loader_train, loader_val
 
@@ -181,12 +200,11 @@ def train_main(args):
     loader_val = torch.utils.data.DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
     device = set_device()
-    setup_seed(RANDOM_SEED)  # 设置随机种子
+    setup_seed(RANDOM_SEED)
 
     model = MambaSSM()  # 使用Mamba模型
-    # model = nn.DataParallel(model)  # 多GPU训练
 
-    criterion = nn.MSELoss()
+    criterion = CombinedLoss()
 
     params = net_lr(model, FC_LR, NET_LR)
 
@@ -206,6 +224,7 @@ def train_main(args):
         optimizer = load_optimizer(optimizer, filepath, device=device)
 
     train(model, optimizer, criterion, device=device, epochs=EPOCH, start=start_epoch)
+
 
 if __name__ == '__main__':
     print("RANDOM SEED:", RANDOM_SEED)
