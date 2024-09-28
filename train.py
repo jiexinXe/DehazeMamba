@@ -9,15 +9,15 @@ import torch.nn as nn
 import torch
 from torch.cuda.amp import GradScaler, autocast
 
-from model import MambaSSM  # 引入 MambaSSM 模型
+from model import MambaSSM  # 导入新的 MambaSSM 模型
 from utils import *  # 导入工具函数
 import dataloader
 
 # 全局变量和参数
 dtype = torch.float16  # 切换为 float16
 USE_GPU = True
-EPOCH = 12
-BATCH_SIZE = 2
+EPOCH = 100
+BATCH_SIZE = 2  # 调整为2以减少显存占用
 ACCUMULATION_STEPS = 4  # 梯度累积步数
 print_every = int(50 / BATCH_SIZE * 64)
 Load_model = False
@@ -37,27 +37,29 @@ START_EPOCH = 0
 loader_train = None
 loader_val = None
 
-# 设备
+
+# 设置设备（GPU或CPU）
 def set_device():
     if USE_GPU and torch.cuda.is_available():
         device = torch.device('cuda')
     else:
         device = torch.device('cpu')
 
-    print('using device:', device)
+    print('Using device:', device)
     return device
+
 
 # 训练函数
 def train(model, optimizer, criterion, device, epochs=1, start=0):
     global loader_train, loader_val
-    model = model.to(device=device)
-    scaler = GradScaler()  # 使用 PyTorch 的混合精度训练，防止显存不够
+    model = model.to(device=device)  # 将模型参数移动到设备（CPU/GPU）
+    scaler = GradScaler()  # 使用 PyTorch 的混合精度训练
 
     if not os.path.isdir(NAME + '_save'):
         os.mkdir(NAME + '_save')
 
     for e in range(start, epochs):
-        print('epoch: %d' % e)
+        print(f'Epoch: {e}')
 
         losses = AverageMeter()
         batch_time = AverageMeter()
@@ -69,7 +71,7 @@ def train(model, optimizer, criterion, device, epochs=1, start=0):
         optimizer.zero_grad()  # 初始化优化器梯度
         for t, (img_original, img_haze) in enumerate(loader_train):
             model.train()  # 设置模型为训练模式
-            img_original = img_original.to(device=device).half()
+            img_original = img_original.to(device=device).half()  # 将数据转换为 float16 并移动到设备（例如 GPU）
             img_haze = img_haze.to(device=device).half()
 
             if hasattr(torch.cuda, 'empty_cache'):
@@ -93,20 +95,14 @@ def train(model, optimizer, criterion, device, epochs=1, start=0):
             end_time = time.time()
 
             if t % print_every == 0:
-                print('Train: [%d/%d]\t'
-                      'Time %.3f (%.3f)\t'
-                      'Loss %.4f (%.4f)'
-                      % (t, len(loader_train), batch_time.val, batch_time.avg, losses.val, losses.avg))
+                print(f'Train: [{t}/{len(loader_train)}]\t'
+                      f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      f'Loss {losses.val:.4f} ({losses.avg:.4f})')
 
         test_epoch(model, criterion, loader_val, device, e, epochs)
 
-        save_model_optimizer_history(model, optimizer, filepath=NAME + '_save' + '/epoch%d.pth' % (e), device=device)
+        save_model_optimizer_history(model, optimizer, filepath=f'{NAME}_save/epoch{e}.pth', device=device)
 
-# 将张量转换为图像并显示
-def tensor_showImg(a):
-    a = a.cpu()
-    image_PIL = transforms.ToPILImage()(a)
-    image_PIL.show()
 
 # 测试函数
 def test_epoch(model, criterion, loader_val, device, epoch, end_epoch, verbo=True):
@@ -114,33 +110,28 @@ def test_epoch(model, criterion, loader_val, device, epoch, end_epoch, verbo=Tru
     losses = AverageMeter()
 
     model.eval()
-    total = 0
-    correct = 0
     end_time = time.time()
-    for batch_idx, (img_original, img_haze) in enumerate(loader_val):
-        img_original = img_original.to(device=device, dtype=dtype)
-        img_haze = img_haze.to(device=device, dtype=dtype)
-        img_original, img_haze = Variable(img_original), Variable(img_haze)
+    with torch.no_grad():
+        for batch_idx, (img_original, img_haze) in enumerate(loader_val):
+            img_original = img_original.to(device=device, dtype=dtype)
+            img_haze = img_haze.to(device=device, dtype=dtype)
 
-        with autocast():
-            output = model(img_haze)
-            output = output.to(device=device)
+            with autocast():
+                output = model(img_haze)
+                loss = criterion(output, img_original)
 
-            loss = criterion(output, img_original)
+            losses.update(loss.item())
 
-        losses.update(loss.cpu().data.numpy())
+            batch_time.update(time.time() - end_time)
+            end_time = time.time()
 
-        batch_time.update(time.time() - end_time)
-        end_time = time.time()
+            if batch_idx % 20 == 0 and verbo:
+                print(f'Test: [{batch_idx}/{len(loader_val)}]\t'
+                      f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      f'Loss {losses.val:.4f} ({losses.avg:.4f})')
 
-        if batch_idx % 20 == 0 and verbo == True:
-            print('Test: [%d/%d]\t'
-                  'Time %.3f (%.3f)\t'
-                  'Loss %.4f (%.4f)' % (batch_idx, len(loader_val),
-                                       batch_time.val, batch_time.avg,
-                                       losses.val, losses.avg))
+    print(f'Test: [{epoch}/{end_epoch}]')
 
-    print('Test: [%d/%d]' % (epoch, end_epoch))
 
 # 检查参数是否属于全连接层
 def is_fc(para_name):
@@ -152,6 +143,7 @@ def is_fc(para_name):
     else:
         return False
 
+
 # 设置网络的学习率
 def net_lr(model, fc_lr, lr):
     params = []
@@ -162,6 +154,7 @@ def net_lr(model, fc_lr, lr):
             params += [{'params': [param_value], 'lr': lr}]
     return params
 
+
 # 设置随机种子
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -169,6 +162,7 @@ def setup_seed(seed):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
+
 
 # 训练主函数
 def train_main(args):
@@ -184,8 +178,6 @@ def train_main(args):
     setup_seed(RANDOM_SEED)  # 设置随机种子
 
     model = MambaSSM()  # 使用Mamba模型
-    # model = nn.DataParallel(model)  # 多GPU训练
-
     criterion = nn.MSELoss()
 
     params = net_lr(model, FC_LR, NET_LR)
@@ -193,27 +185,22 @@ def train_main(args):
     if OPTIMIZER == 'adam':
         optimizer = torch.optim.Adam(params, betas=(0.9, 0.999), weight_decay=0, eps=1e-08)
     else:
-        optimizer = torch.optim.SGD(params, momentum=MOMENTUM, nesterov=True,
-                                    weight_decay=WEIGHT_DECAY)
+        optimizer = torch.optim.SGD(params, momentum=MOMENTUM, nesterov=True, weight_decay=WEIGHT_DECAY)
 
     print(model)
     start_epoch = 0
     if Load_model:
-        start_epoch = 25
         filepath = 'load_model_path'
         model = load_model(model, filepath, device=device)
-        model = model.to(device=device)
         optimizer = load_optimizer(optimizer, filepath, device=device)
 
     train(model, optimizer, criterion, device=device, epochs=EPOCH, start=start_epoch)
 
-if __name__ == '__main__':
-    print("RANDOM SEED:", RANDOM_SEED)
 
+if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Dehaze image with Mamba')
     parser.add_argument('--original_pic_root', type=str, help='path of train image npy', default='data/images/')
     parser.add_argument('--haze_pic_root', type=str, help='path of test image npy', default='data/data/')
-
     args = parser.parse_args()
 
     train_main(args)
